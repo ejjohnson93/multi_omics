@@ -1,0 +1,1232 @@
+---
+title: "Fibroblast data analysis"
+---
+
+# Info 
+
+The following is the creation of a multi-omics model of fibroblast ageing using pathways as features and built using MOFA2. 
+
+The data used to create the model is from here:
+
+https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-4385/
+https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-4382/
+
+The original reference is here:
+
+https://onlinelibrary.wiley.com/doi/10.1111/acel.12470
+
+
+# Data download and processing
+
+## Set-up and libraries 
+
+Firstly, install packages as needed. 
+
+```{r}
+
+#BiocManager::install("ArrayExpress")
+#BiocManager::install("HsAgilentDesign026652.db")
+#BiocManager::install(c("GSEABase","GSVA"))
+
+install.packages("glmnet")
+install.packages("BiocManager")
+
+BiocManager::install(c("GSEABase", "Biobase", "ROCit", "pROC", "limma", "GSVA", "cogena", "GEOquery", "annotate", "org.Hs.eg.db", "illuminaHumanv4.db", "biomaRt", "ArrayExpress", "IlluminaHumanMethylation450kanno.ilmn12.hg19", "IlluminaHumanMethylation450kmanifest", "HsAgilentDesign026652.db", "dplyr"))
+BiocManager::install("minfi", dependencies = T)
+
+
+```
+
+
+Load libraries
+
+```{r}
+
+library(limma)
+library(tidyverse)
+library(minfi)
+library(GSVA)
+library(GSEABase)
+library(ggplot2)
+library(annotate)
+library(biomaRt)
+library(ArrayExpress)
+library(Biobase)
+library(HsAgilentDesign026652.db)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylation450kmanifest)
+library(reshape)
+library(colorspace)
+library(ChAMP)
+library(ggpubr)
+library(MOFA2)
+#library(methylationArrayAnalysis)
+
+```
+
+## Transcript data
+
+### Set-up, download and processing: 
+
+Arrayexpress page: https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-4385/
+
+Make directories:
+
+```{r}
+
+if (!dir.exists("./raw_transcript_data")) {
+    dir.create("./raw_transcript_data")
+}
+
+if (!dir.exists("./raw_methylation_data")) {
+    dir.create("./raw_methylation_data")
+}
+
+if (!dir.exists("./processed_data")) {
+    dir.create("./processed_data")
+}
+
+if (!dir.exists("./outputs")) {
+    dir.create("./outputs")
+}
+
+
+```
+
+Download data:
+
+```{r}
+
+rawset <- ArrayExpress("E-MTAB-4382", path="./raw_transcript_data", save = TRUE)
+
+```
+
+
+Read in data:
+
+```{r}
+
+SDRF <- read.delim("./raw_transcript_data/E-MTAB-4382.sdrf.txt",check.names=FALSE,stringsAsFactors=FALSE)
+
+x <- read.maimages(paste0("./raw_transcript_data/", 
+                  SDRF[,"Array Data File"]),
+                  source="agilent", green.only=TRUE,
+                  other.columns="gIsWellAboveBG")
+
+```
+
+
+Create version of SDRF that only has nessecary data and a new column for age groups. 
+
+```{r}
+pheno <- SDRF %>% dplyr::select("Source Name", "Factor Value[age]", "Assay Name", "Characteristics[sex]") %>% distinct(
+    `Source Name`, .keep_all = TRUE) %>% mutate(
+    Age_group = case_when(
+    `Factor Value[age]` >= 60 ~ "Old",
+    `Factor Value[age]` > 30 & `Factor Value[age]` < 60 ~ "Middle-aged",
+    `Factor Value[age]` <= 30 ~ "Young"
+    ))
+
+write.csv(pheno, "./processed_data/skin_ageing_transcript_phenotype.csv")
+```
+
+
+Annotation:
+
+```{r}
+
+x$genes$EntrezID <- mapIds(HsAgilentDesign026652.db, 
+                           x$genes$ProbeName,keytype="PROBEID", 
+                           column="ENTREZID")
+
+x$genes$Symbol <- mapIds(HsAgilentDesign026652.db,
+                         x$genes$ProbeName,keytype="PROBEID",
+                         column="SYMBOL")
+
+annotation <- x$genes
+
+# Alternative way to get annotation: 
+# annotation <- getGEO("GPL17077")
+
+
+```
+
+Background correction and normalisation: 
+
+
+```{r}
+
+x_background <- backgroundCorrect(x, method="normexp")
+x_normalised <- normalizeBetweenArrays(x_background, method="quantile")
+
+```
+
+Filtering: 
+
+```{r}
+
+Control <- x_normalised$genes$ControlType==1
+NoSymbol <- is.na(x_normalised$genes$Symbol)
+IsExpr <- rowSums(x_normalised$other$gIsWellAboveBG > 0) >= 4
+
+x_filt <- x_normalised[!Control & !NoSymbol & IsExpr, ]
+#x_filt <- x_normalised[!Control & !NoSymbol, ]
+
+print(dim(x_normalised))
+print(dim(x_filt))
+
+```
+
+
+Exploration/QC of data: 
+
+MDS plots:
+
+```{r}
+
+pal <- rainbow_hcl(3)
+mds <- plotMDS(x_filt, labels=pheno$`Factor Value[age]`, col=pal[factor(pheno$Age_group)])
+
+```
+
+
+```{r}
+par(mfrow=c(1,3))
+plotMDS(x_filt, labels=pheno$`Factor Value[age]`, 
+        col=pal[factor(pheno$Age_group)], dim=c(1,3))
+
+plotMDS(x_filt, labels=pheno$`Factor Value[age]`, 
+        col=pal[factor(pheno$Age_group)], dim=c(2,3))
+
+
+plotMDS(x_filt, labels=pheno$`Factor Value[age]`, 
+        col=pal[factor(pheno$Age_group)], dim=c(3,4))
+
+```
+
+
+PCA plot: 
+
+```{r}
+
+pca_res <- prcomp(t(x_filt$E), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p<-ggplot(df_out,aes(x=PC1,y=PC2,color=pheno$Age_group))
+p<-p+geom_point()
+p
+
+
+```
+
+Boxplot: 
+
+```{r}
+
+boxplot(x_filt$E,ylab="log2 intensity",xlab="Sample")
+
+```
+
+Density plot:
+
+```{r}
+
+plot(density(x_filt$E[,1]))
+for(i in 2:ncol(x_filt$E)) { lines(density(x_filt$E[,i])) }
+
+
+```
+
+
+Output a dataframe of processed and annotated Log2 transformed data:
+```{r}
+# Assign data to new variable and remove directory path from col names
+data <- x_filt$E
+colnames(data)<-gsub("./raw_transcript_data/","",colnames(data))
+
+# Make sure columns are in the same order as the phenotype data
+data <- data[,match(SDRF$`Assay Name`, colnames(data))]
+
+# Rename columns with source name from phenotype data instead
+# Rename rows with the gene symbol annotation 
+rownames(data) <- x_filt$genes$Symbol
+colnames(data) <- SDRF$`Source Name`
+
+# Assign the annotation/feature data to its own variable
+processed_annotation <- x_filt$genes
+
+# Save the processed data and annotation 
+write.csv(data, "./processed_data/skin_ageing_transcript_data.csv")
+write.csv(processed_annotation, "./processed_data/skin_ageing_transcript_annotation.csv")
+
+```
+
+There are multiple probes per gene, before pathway analysis need to average reads per gene. Use avereps function to do this. 
+
+```{r}
+# Read in data if starting again from this point
+data <- read.csv("./processed_data/skin_ageing_transcript_data.csv", header = TRUE)
+processed_annotation <- read.csv("./processed_data/skin_ageing_transcript_annotation.csv", header = TRUE)
+
+# Average reads for genes across probes
+summed_dat <- avereps(as.matrix(data), ID = processed_annotation$Symbol)
+
+# Convert row 1 to rownames and data back to numeric if data was read in from .csv file
+rownames(summed_dat) <- summed_dat[,1]
+summed_dat <- summed_dat[,2:ncol(summed_dat)]
+mode(summed_dat) = "numeric"
+
+```
+
+```{r}
+# QC - avereps should have condensed according to gene symbol from feature data
+#    - so length should be the same as the number of unique gene symbols
+nrow(summed_dat); length(unique(processed_annotation$Symbol))
+
+```
+
+Write a file of processed skin data with repeat probes removed. 
+
+```{r}
+
+write.csv(summed_dat, "./processed_data/skin_ageing_transcript_SUMMARY_DATA.csv")
+
+```
+
+```{r}
+
+pca_res <- prcomp(t(summed_dat), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p<-ggplot(df_out,aes(x=PC1,y=PC2,color=pheno$Age_group))
+p<-p+geom_point()
+p
+
+
+```
+
+The clusters aren't especially pronounced but at least all the young samples appear to be clustering together...
+
+
+
+### Pathway expression with GSVA: 
+
+Before carrying out analysis need to create a genesets file. For preliminary analysis want to make use of all canonical pathways but might be interesting to focus on kegg pathways if possible to make use of the pathview package in analysis too: 
+
+https://pathview.r-forge.r-project.org/ 
+
+```{r}
+
+#######################################################################
+
+#### Create gene sets file ####
+
+# These are all coming from the GSEA site (http://www.gsea-msigdb.org/gsea/msigdb/collections.jsp)
+# Download dataset from broad as required, compress, and upload into /usr/local/lib/R/site-library/cogena/extdata
+# https://data.broadinstitute.org/gsea-msigdb/msigdb/release/7.4/
+# -----------------------------------
+
+
+# annoGMT <- "c2.cp.kegg.v7.4.symbols.gmt.xz" # KEGG subset of CP
+# annoGMT <- "c5.bp.v7.01.symbols.gmt.xz" # BP: subset of GO
+# annoGMT <- "c5.go.cc.v7.4.symbols.gmt.xz" # CC: subset of GO
+# annoGMT <- "c5.go.mf.v7.4.symbols.gmt.xz" # MF: subset of GO
+# annoGMT <- "c3.tft.v7.4.symbols.gmt.xz" # TFT: transcription factor targets
+annoGMT <- "c2.cp.reactome.v7.4.symbols.gmt.xz" # REACTOME subset of CP
+# annoGMT <- "c4.all.v7.4.symbols.gmt.xz" # C4: computational gene sets
+# annoGMT <- "c2.cgp.v7.4.symbols.gmt.xz" # CGP: chemical and genetic perturbations
+# annoGMT <- "h.all.v7.4.symbols.gmt.xz" # H:hallmark gene sets
+# annoGMT <- "c6.all.v7.4.symbols.gmt.xz" # C6: oncogenic signature gene sets
+# annoGMT <- "c2.cp.v7.0.symbols.gmt.xz" # all canonical pathways 
+
+###
+
+annofile <- system.file("extdata", annoGMT, package="cogena")
+
+# Modify'annoGMT' as appropriate to get relevant gene set then assign to variables below
+# In this case wanted all canonical pathways, hallmarks pathways and kegg pathways
+
+# All 
+gene_set_all <-getGmt(annofile,
+                 geneIdType=SymbolIdentifier(),
+                 collectionType=BroadCollection(category="h")
+)
+
+# Hallmarks
+gene_set_hallmarks <-getGmt(annofile,
+                 geneIdType=SymbolIdentifier(),
+                 collectionType=BroadCollection(category="h")
+)
+
+# Kegg 
+gene_set_kegg <-getGmt(annofile,
+                 geneIdType=SymbolIdentifier(),
+                 collectionType=BroadCollection(category="h")
+)
+
+
+# Reactome 
+gene_set_reactome <-getGmt(annofile,
+                 geneIdType=SymbolIdentifier(),
+                 collectionType=BroadCollection(category="h")
+)
+
+#######################################################################
+
+
+```
+
+GSVA analysis:
+
+Read in data if starting again from this point...
+
+```{r}
+
+# summed_data <- read.csv("./processed_data/skin_ageing_transcript_SUMMARY_DATA.csv", header = TRUE)
+
+```
+
+
+```{r}
+
+# gsva method 
+
+# All pathways
+transcript_gsva <- gsva(summed_dat,
+                          gene_set_all,
+                          method="gsva",
+                          kcdf="Gaussian",
+                          min.sz = 4,
+                          parallel.sz=8
+)
+
+write.csv(transcript_gsva, "./outputs/skin_transcript_gsva_all.csv")
+
+
+# Hallmarks
+transcript_gsva <- gsva(summed_dat,
+                          gene_set_hallmarks,
+                          method="gsva",
+                          kcdf="Gaussian",
+                          min.sz = 4,
+                          parallel.sz=8
+)
+
+write.csv(transcript_gsva, "./outputs/skin_transcript_gsva_hallmarks.csv")
+
+# Kegg
+transcript_gsva <- gsva(summed_dat,
+                          gene_set_kegg,
+                          method="gsva",
+                          kcdf="Gaussian",
+                          min.sz = 4,
+                          parallel.sz=8
+)
+
+write.csv(transcript_gsva, "./outputs/skin_transcript_gsva_kegg.csv")
+
+# Reactome
+transcript_ssgsea <- gsva(summed_dat,
+                   gene_set_reactome,
+                   method="gsva",
+                   kcdf="Gaussian",
+                   min.sz = 4,
+                   parallel.sz=8
+)
+
+write.csv(transcript_ssgsea, "./outputs/skin_transcript_gsva_reactome.csv")
+
+
+```
+
+## Methylation data
+
+### Set-up, download and processing: 
+
+Arrayexpress page: https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-4382/
+
+```{r}
+
+rawset_methylation <- ArrayExpress("E-MTAB-4385", path="./raw_methylation_data", save = TRUE)
+
+```
+
+```{r}
+
+file_path <- file.path("./raw_methylation_data/")
+list.files(file_path)
+
+```
+
+Targets file wasn't available in the download, create manually using the SDRF file. Only include columns of interest to the analysis/ones that aren't repeated, then remove all the rows corresponding to the red channel so there's one row per sample. Also include another column categorising the samples as young, middle aged or old since the original paper grouped them:
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4854925/
+
+To create a 'basename' column, copy the assay name column and remove the "_Grn" suffix. Finally, replace white-space in column names with underscores. 
+
+
+```{r}
+SDRF_meth <- read.delim(paste0(file_path, "/E-MTAB-4385.sdrf.txt"),check.names=FALSE,stringsAsFactors=FALSE)
+
+targets <- SDRF_meth %>% dplyr::select("Source Name", "Factor Value[age]", "Assay Name", "Characteristics[sex]") %>% distinct(
+    `Source Name`, .keep_all = TRUE) %>% mutate(
+    Age_group = case_when(
+    `Factor Value[age]` >= 60 ~ "Old",
+    `Factor Value[age]` > 30 & `Factor Value[age]` < 60 ~ "Middle-aged",
+    `Factor Value[age]` <= 30 ~ "Young"
+    ))
+
+targets$`Assay Name` <- paste0(gsub(pattern = "_Grn", replacement = "", x = targets$`Assay Name`))
+targets$Basename <- paste0(file_path, "/", targets$`Assay Name`)
+colnames(targets) <- gsub("\\s", "_", colnames(targets))
+
+ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+
+```
+Read in data...
+
+```{r}
+
+raw_set <- read.metharray.exp(targets = targets, verbose = TRUE)
+
+```
+
+Rename samples with more informative names.
+
+```{r}
+
+sampleNames(raw_set) <- targets$Source_Name
+
+# Manually inspected before and after to make sure they match up 
+
+```
+
+```{r}
+
+detP <- detectionP(raw_set)
+
+```
+
+```{r}
+
+qcReport(raw_set, sampNames=targets$Source_Name, sampGroups=targets$Age_group, pdf="qcReport.pdf")
+
+# not enough memory to produce qc report for dataset
+
+```
+
+Examine the mean detection p-values across all samples to identify any failed samples instead: 
+
+```{r}
+
+pal_rainbow <- rainbow_hcl(108)
+barplot(colMeans(detP), col=pal_rainbow[factor(targets$Source_Name)], ylim=c(0,0.002), ylab="Mean detection p-values")
+#abline(h=0.05,col="red")
+
+```
+
+All samples passed!
+
+Compare beta values for raw and normalised data:
+
+```{r}
+
+mSetSq <- preprocessQuantile(raw_set) 
+
+```
+'An inconsistency was encountered while determining sex. One possibility is that only one sex is present.'
+
+Note: all samples are female, hence the warning.
+
+```{r}
+
+mSetRaw <- preprocessRaw(raw_set)
+
+```
+
+
+```{r}
+
+par(mfrow=c(1,2))
+densityPlot(raw_set, sampGroups=targets$Age_group,main="Raw", legend=FALSE)
+densityPlot(getBeta(mSetSq), sampGroups=targets$Age_group,
+            main="Normalized", legend=FALSE)
+
+```
+
+```{r}
+
+densityBeanPlot(getBeta(mSetSq), sampGroups=targets$Age_group) 
+
+```
+
+Preliminary exploration of the data: 
+
+```{r}
+
+pal <- rainbow_hcl(3)
+mds <- plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Age_group)])
+
+```
+
+
+```{r}
+par(mfrow=c(1,3))
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Age_group)], dim=c(1,3))
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Age_group)], dim=c(2,3))
+
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Age_group)], dim=c(3,4))
+
+```
+
+
+
+```{r}
+
+outliers <- mds[["y"]][(mds[["y"]] > 0.9)]
+
+print(names(outliers))
+
+```
+
+Four of the 70+ datapoints seperate strangely on the MDS graph. Unsure if age related effect as they seperate in opposite directions along PC3. Replot the data without the middle-aged data points and without the outliers to see how it looks? 
+
+Firstly, just without the middle-aged...
+
+```{r}
+
+filtered_data <- getM(mSetSq)
+filtered_data <- filtered_data[,targets$Age_group != "Middle-aged"]
+filtered_targets <- targets[targets$Age_group != "Middle-aged",]
+
+ncol(filtered_data); nrow(targets[targets$Age_group == "Young" | targets$Age_group == "Old",]) ; nrow(filtered_targets)
+
+```
+
+
+```{r}
+
+pal <- rainbow_hcl(3)
+plotMDS(filtered_data, top=1000, gene.selection="common", 
+        col=pal[factor(filtered_targets$Age_group)])
+
+```
+
+Already better, seperating by age along PC2 (unsure what is contributing to PC1 - maybe a batch effect).
+Now without outliers...
+
+```{r}
+
+filtered_data <- as.data.frame(filtered_data) %>% dplyr::select(!(c("P22_72","P23_74.2","P44_73","P48_72")))
+filtered_targets <- filtered_targets %>% filter(!grepl('P22_72|P23_74.2|P44_73|P48_72', filtered_targets$Source_Name))
+
+colnames(filtered_data) == filtered_targets$Source_Name
+
+``` 
+
+
+```{r}
+
+pal <- rainbow_hcl(3)
+plotMDS(filtered_data, top=1000, gene.selection="common", 
+        col=pal[factor(filtered_targets$Age_group)])
+
+```
+
+
+```{r}
+
+par(mfrow=c(1,3))
+plotMDS(filtered_data, top=1000, gene.selection="common", 
+        col=pal[factor(filtered_targets$Age_group)], dim=c(1,3))
+
+plotMDS(filtered_data, top=1000, gene.selection="common", 
+        col=pal[factor(filtered_targets$Age_group)], dim=c(2,3))
+
+
+plotMDS(filtered_data, top=1000, gene.selection="common", 
+        col=pal[factor(filtered_targets$Age_group)], dim=c(3,4))
+
+```
+
+PC1 also seems to be affected by age when removing the outliers just as a more subtle effect. PC2 much more strongly.
+SVD in the original paper identified age as the major batch effect so all seems fine to proceed.
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4854925/
+
+For now, process/filter the whole dataset and perhaps remove the middle-aged group/outliers after additional processing if needed. 
+
+
+### Filtering: 
+
+Firstly, ensure probes are in the same order in the mSetSq and detP objects:
+
+```{r}
+
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+
+```
+
+Remove any probes that have failed in one or more samples:
+
+```{r}
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+
+```
+
+```{r}
+
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+
+```
+
+Remove probes on the sex chromosomes:
+(Unnessecary in this case as all samples are female but code is below for future use)
+
+```{r}
+
+# keep <- !(featureNames(mSetSqFlt) %in% ann450k$Name[ann450k$chr %in% 
+#                                                        c("chrX","chrY")])
+# table(keep)
+# mSetSqFlt <- mSetSqFlt[keep,]
+
+```
+
+Remove probes with SNPs at CpG site:
+
+```{r}
+
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+
+```
+
+Exclude cross-reactive probes: 
+
+```{r}
+
+dataDirectory <- system.file("extdata", package = "methylationArrayAnalysis")
+
+xReactiveProbes <- read.csv(file=paste(dataDirectory,
+                                       "48639-non-specific-probes-Illumina450k.csv",
+                                       sep="/"), stringsAsFactors=FALSE)
+keep <- !(featureNames(mSetSqFlt) %in% xReactiveProbes$TargetID)
+table(keep)
+
+```
+
+```{r}
+
+mSetSqFlt <- mSetSqFlt[keep,] 
+mSetSqFlt
+
+```
+
+Now plot data again to see how it compares after initial processing... 
+
+```{r}
+
+pal <- rainbow_hcl(3)
+mds <- plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Age_group)])
+
+```
+
+After filtering the data seperates by age group (oldest samples on left, youngest on right).
+
+Next extract mValues and bValues...
+mValues are better for analysis, review here: https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-11-587
+
+
+```{r}
+
+mVals <- getM(mSetSqFlt)
+bVals <- getBeta(mSetSqFlt)
+
+```
+
+```{r}
+
+densityPlot(bVals, sampGroups=targets$Age_group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+densityPlot(mVals, sampGroups=targets$Age_group, main="M-values", 
+            legend=FALSE, xlab="M values")
+
+```
+
+Assess general features of data after filtering 
+
+```{r}
+
+CpG.GUI(CpG=rownames(mVals),arraytype="450K")
+
+```
+
+Carry out SVD 
+```{r}
+
+champ.SVD(beta=mVals,pd=targets)
+
+```
+
+Processed raw data seems fine for further analysis but before carrying out pathway analysis several additional steps need to be carried out to ensure the methylation data is in a similar feature space to the transcriptomics data. 
+
+
+First save the mVals and annotation:
+
+```{r}
+
+write.csv(mVals, "./processed_data/skin_ageing_methylation_mvals.csv")
+write.csv(ann450k, "./processed_data/skin_ageing_methylation_annotation.csv")
+
+```
+
+
+(If picking up analysis from this point data can be loaded in as previously.)
+
+
+Then filter the IlluminaHumanMethylation450kmanifest so it only contains the probes from the mVals in the same order.
+
+```{r}
+
+ann450k_flt <- as.data.frame(ann450k)
+ann450k_flt <- ann450k_flt[match(rownames(mVals),ann450k_flt$Name),]
+
+```
+
+After this, filter it further so it only contains probes associated with islands and those that have standard gene names. 
+```{r}
+
+# standard gene names
+ann450k_flt <- ann450k_flt[!is.na(ann450k_flt$UCSC_RefGene_Name),]
+# islands
+ann450k_flt <- ann450k_flt[ann450k_flt$Relation_to_Island == "Island",]
+
+
+```
+
+Next, extract only the probes associated with promoter regions:
+
+```{r}
+
+ann450k_promoters_only <- ann450k_flt
+ann450k_promoters_only$RefGeneGroupSimple <- gsub(";.*" , "" ,ann450k_promoters_only$UCSC_RefGene_Group)
+ann450k_promoters_only <- ann450k_promoters_only[ann450k_promoters_only$RefGeneGroupSimple %in% c("TSS1500", "TSS200", "1stExon"),]
+
+```
+
+Add new column to get the plain gene name: 
+
+```{r}
+
+ann450k_promoters_only$RefGeneNameSimple <- gsub(";.*" , "" ,ann450k_promoters_only$UCSC_RefGene_Name)
+dim(ann450k_promoters_only)
+
+```
+
+Now use the edited IlluminaHumanMethylation450kmanifest manifest to further filter the mVals by matching the rownames once again.
+
+```{r}
+
+mVals_promoter_only <- mVals[match(ann450k_promoters_only$Name, rownames(mVals)),]
+dim(mVals_promoter_only)
+
+```
+
+
+Plot the data to see how it looks: 
+
+
+```{r}
+
+pca_res <- prcomp(t(mVals_promoter_only), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p1<-ggplot(df_out,aes(x=PC1,y=PC2,color=targets$Source_Name))
+p1<-p1+geom_point()
+p1
+
+
+```
+
+
+```{r}
+
+p2<-ggplot(df_out,aes(x=PC1,y=PC2,color=targets$`Factor_Value[age]`))
+p2<-p2+geom_point()
+p2
+
+```
+
+
+```{r}
+
+ggarrange(p1, p2, 
+          labels = c("A", "B"),
+          ncol = 1, nrow = 2)
+
+```
+
+The phenotype data doesn't mention technical details but PC1 appears to be a batch effect. The samples on the right correspond with the samples used in the transcriptomics analysis (which were presumably extracted under different conditions) and the samples on the left are the additional ones exclusive to the methylation analysis. 
+
+After comparing the two phenotype files, any sample with a decimal point in the sample name corresponds to the transcriptomics data. Those without the decimal point are exclusive to the methylation data. These data points are going to be removed anyway for the MOFA analysis so don't need to carry out a batch correction.
+
+
+Next, save the processed annotation, phenotype data and mVals to .csv files. 
+
+```{r}
+write.csv(mVals_promoter_only, "./processed_data/skin_ageing_methylation_mvals_promoterOnly.csv")
+write.csv(ann450k_promoters_only, "./processed_data/skin_ageing_methylation_annotation_promoterOnly.csv")
+write.csv(targets, "./processed_data/skin_ageing_methylation_phenotype_promoterOnly.csv")
+
+
+```
+
+Next, annotate probes and average reads as done previously with the transcriptomics data.
+
+```{r}
+
+### Annotate probes and average reads
+# Create summary expression table - average intensity per gene
+methyl_sum_dat <- avereps(as.matrix(mVals_promoter_only), ID = ann450k_promoters_only$RefGeneNameSimple)
+
+
+# QC - avereps should have condensed according to simple gene names from feature data
+#    - so length should be the same as the number of unique simple gene names
+nrow(methyl_sum_dat); length(unique(ann450k_promoters_only$RefGeneNameSimple))
+# Save a copy of annotated summary expression table
+write.csv(methyl_sum_dat, "./processed_data/skin_ageing_methylation_SUMMARY_DATA.csv")
+
+
+
+```
+
+
+### Pathway expression with GSVA: 
+
+Can use previously generated geneset file from transcript data. 
+
+Read in data if starting again from this point...
+
+```{r}
+
+# Read in data if starting again from this point
+methyl_sum_dat <- read.csv("./processed_data/skin_ageing_methylation_SUMMARY_DATA.csv", header = TRUE)
+
+# Convert row 1 to rownames and data back to numeric if data was read in from .csv file
+rownames(methyl_sum_dat) <- methyl_sum_dat[,1]
+methyl_sum_dat <- as.matrix(methyl_sum_dat[,2:ncol(methyl_sum_dat)])
+
+```
+
+
+```{r}
+
+# gsva method 
+
+# All pathways
+methylation_gsva <- gsva(methyl_sum_dat,
+                           gene_set_all,
+                           method="gsva",
+                           kcdf="Gaussian",
+                           min.sz = 4,
+                           parallel.sz=8
+)
+
+write.csv(methylation_gsva, "./outputs/skin_methylation_gsva_all.csv")
+
+
+# Hallmarks
+methylation_gsva <- gsva(methyl_sum_dat,
+                           gene_set_hallmarks,
+                           method="gsva",
+                           kcdf="Gaussian",
+                           min.sz = 4,
+                           parallel.sz=8
+)
+
+write.csv(methylation_gsva, "./outputs/skin_methylation_gsva_hallmarks.csv")
+
+# Kegg
+methylation_gsva <- gsva(methyl_sum_dat,
+                           gene_set_kegg,
+                           method="gsva",
+                           kcdf="Gaussian",
+                           min.sz = 4,
+                           parallel.sz=8
+)
+
+write.csv(methylation_gsva, "./outputs/skin_methylation_gsva_kegg.csv")
+
+# Reactome
+methylation_gsva <- gsva(methyl_sum_dat,
+                   gene_set_reactome,
+                   method="gsva",
+                   kcdf="Gaussian",
+                   min.sz = 4,
+                   parallel.sz=8
+)
+
+write.csv(transcript_ssgsea, "./outputs/skin_methylation_gsva_reactome.csv")
+
+```
+
+# MOFA analysis 
+
+## Pathways 
+
+Some mofa tutorials/documentation:
+
+- https://biofam.github.io/MOFA2/tutorials.html
+- https://raw.githack.com/bioFAM/MOFA2_tutorials/master/R_tutorials/getting_started_R.html
+- https://raw.githack.com/bioFAM/MOFA2_tutorials/master/R_tutorials/GSEA.html
+- https://raw.githack.com/bioFAM/MOFA2_tutorials/master/R_tutorials/scRNA_gastrulation.html
+
+To begin with carry out MOFA analysis on the pathway enrichment data for the transcriptomiocs and methylation data. 
+
+Start with the enrichment values for all the pathway data (then either kegg or reactome as appropriate) calculated using the GSVA method. 
+
+### Load in data + QC
+
+```{r}
+
+# Transcript data
+transcript_dat <- read.csv("./outputs/skin_transcript_gsva_all.csv", header = TRUE)
+rownames(transcript_dat) <- transcript_dat[,1]
+transcript_dat <- transcript_dat[,2:ncol(transcript_dat)]
+
+
+# Methylation data
+methylation_dat <- read.csv("./outputs/skin_methylation_gsva_all.csv", header = TRUE)
+rownames(methylation_dat) <- methylation_dat[,1]
+methylation_dat <- methylation_dat[,2:ncol(methylation_dat)]
+
+
+# Pheno data
+pheno <- read.csv("./processed_data/skin_ageing_transcript_phenotype.csv", header = TRUE)
+pheno <- pheno[,2:ncol(pheno)]
+
+```
+
+Transcriptomics data only has 59 samples vs 108 for the methylation data. Filter the methylation data so it only contains samples present in the transcriptomics data. 
+
+```{r}
+
+methylation_dat <- methylation_dat[,colnames(methylation_dat) %in% colnames(transcript_dat)]
+methylation_dat <- methylation_dat[,colnames(transcript_dat)]
+
+colnames(methylation_dat) == colnames(transcript_dat) # check that the samples are in same order
+colnames(methylation_dat) == pheno$Source.Name # also in phenotype file 
+
+```
+
+```{r}
+
+pca_res <- prcomp(t(methylation_dat), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p1<-ggplot(df_out,aes(x=PC1,y=PC2,color=pheno$Age_group))
+p1<-p1+geom_point()
+p1
+
+
+```
+
+```{r}
+
+pca_res <- prcomp(t(transcript_dat), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p2<-ggplot(df_out,aes(x=PC1,y=PC2,color=pheno$Age_group))
+p2<-p2+geom_point()
+p2
+
+
+```
+
+### MOFA
+
+```{r}
+
+mofa_dat <- list(meth = as.matrix(methylation_dat),
+                 exp = as.matrix(transcript_dat))
+
+```
+
+```{r}
+
+MOFAobject <- create_mofa(mofa_dat)
+
+print(MOFAobject)
+
+```
+
+```{r}
+
+plot_data_overview(MOFAobject)
+
+```
+
+```{r}
+
+data_opts <- get_default_data_options(MOFAobject)
+data_opts$scale_views <- TRUE
+head(data_opts)
+
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 10
+head(model_opts)
+
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"
+head(train_opts)
+
+```
+
+```{r}
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+```
+
+```{r}
+
+outfile = file.path(getwd(),"model.hdf5")
+MOFAobject.trained <- run_mofa(MOFAobject, outfile)
+
+```
+
+
+```{r}
+plot_variance_explained(
+  MOFAobject.trained, 
+  x = "view", 
+  y = "factor", 
+  plot_total = T
+)
+
+```
+
+
+```{r}
+plot_factor_cor(MOFAobject.trained)
+
+```
+
+
+```{r}
+
+MOFAobject.trained@samples_metadata$sample == pheno$Source.Name
+
+```
+
+
+Add phenotype data to MOFAobject: 
+
+```{r}
+
+MOFAobject.trained@samples_metadata$age <- pheno$Factor.Value.age.
+MOFAobject.trained@samples_metadata$age_group <- as.factor(pheno$Age_group)
+
+```
+
+
+Inspect factors manually... 2&3 show obvious seperation by age... 
+
+```{r}
+plot_factor(MOFAobject.trained, 
+  factor = 3,
+  color_by = "age_group"  # lineage is a column in MOFAobject@samples.metadata
+) 
+
+```
+
+```{r}
+
+pdf("./graphs_figures/factors.pdf", width = 8, height = 6)
+
+plot_factors(MOFAobject.trained, 
+  factors = c(1,2,3),
+  color_by = "age_group"
+) 
+
+dev.off()
+
+```
+
+```{r}
+
+plot_top_weights(MOFAobject.trained, 
+                  view = "meth", 
+                  factor = 2, 
+                  nfeatures = 10,
+                  scale = T, 
+                  abs = T
+)
+
+```
+
+
+```{r}
+
+plot_top_weights(MOFAobject.trained, 
+                  view = "exp", 
+                  factor = 1, 
+                  nfeatures = 10,
+                  scale = T, 
+                  abs = T
+)
+
+
+```
+
+```{r}
+
+plot_top_weights(MOFAobject.trained, 
+                  view = "meth", 
+                  factor = 1, 
+                  nfeatures = 10,
+                  scale = T, 
+                  abs = T
+)
+
+
+```
+
+```{r}
+
+plot_top_weights(MOFAobject.trained, 
+                  view = "exp", 
+                  factor = 3, 
+                  nfeatures = 10,
+                  scale = T, 
+                  abs = T
+)
+
+```
+
+```{r}
+
+plot_top_weights(MOFAobject.trained, 
+                  view = "meth", 
+                  factor = 3, 
+                  nfeatures = 10,
+                  scale = T, 
+                  abs = T
+)
+
+```
+
