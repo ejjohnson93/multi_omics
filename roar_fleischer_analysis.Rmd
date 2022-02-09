@@ -1,0 +1,663 @@
+# Analyis of Fleischer alternative polyadenylation data 
+
+Load libraries
+
+```{r}
+
+library(tidyverse)
+
+# Visualisation 
+library(ggpmisc)
+library(ggpubr)
+library(RColorBrewer)
+
+# Data analysis 
+library(factoextra)
+library(reshape)
+library(pvca)
+library(Biobase)
+library(glmnet)
+
+
+```
+
+## Initial processing
+
+Read in data:
+
+```{r}
+
+data <- read.csv("fleischer_sep_roar_results.csv", header = TRUE)
+data <- as.matrix(data)
+
+```
+
+
+Read in meta-data data:
+
+```{r}
+
+metadata <- read.csv("fleischer_metadata.csv", header = TRUE)
+
+```
+
+Format data for preliminary analysis. First extract only columns with data.
+Then convert matrix into a numeric type, before converting to dataframe. 
+Add additional column with gene names.
+
+
+```{r}
+
+data_plain <- data[,c(1:136,139:274)]
+mode(data_plain) = "numeric"
+data_plain <- data.frame(data_plain)
+data_plain$gene_ID <- data[,138]
+
+```
+
+Remove rows corresponding to NA values for gene names.
+Then use gene names for rownames. 
+
+```{r}
+
+data_plain <- data_plain[!duplicated(data_plain$gene_ID), ]
+data_plain <- data_plain[!is.na(data_plain$gene_ID), ]
+rownames(data_plain) <- data_plain$gene_ID
+
+```
+
+Seperate the TPM data and ratio data. Filter the TPM data to exclude counts below 1. 
+Use the newly fitlered TPM data to subset the ratio data. 
+Then further filter that ratio data to remove outliers. 
+
+```{r}
+
+data_plain_TPM <- data_plain[,137:272]
+
+
+for(i in 1:ncol(data_plain_TPM)){
+    data_plain_TPM <- data_plain_TPM %>% filter(., .[i] > 2)
+   
+}
+
+
+
+data_plain_ratio <- data_plain[,1:136]
+data_plain_ratio <- data_plain_ratio[rownames(data_plain_ratio) %in% rownames(data_plain_TPM),]
+
+
+
+for(i in 1:ncol(data_plain_ratio)){
+    data_plain_ratio <- data_plain_ratio %>% filter(., .[i] > 0 & .[i] <30)
+   
+}
+
+
+```
+
+
+Process the metadata file for use in analysis. Firstly, convert the HPS ages into numeric values (originally listed in yrs and month format), then convert the whole column into numeric values using 'as.numeric'. 
+
+Next extract only the columns of interest for the analysis. Add an additional column to divide the samples into age groups for visualisation purposes. Make sure the HPS samples have their own unique identifier as their aged phenotype means they're likely to more closely resemble the old and middle-aged samples. 
+
+```{r}
+metadata_original <- metadata
+
+metadata[127,2] <- 8
+metadata[128,2] <- 8
+metadata[129,2] <- 2.25
+metadata[130,2] <- 3.75
+metadata[131,2] <- 4.75
+metadata[132,2] <- 8.5
+metadata[133,2] <- 7
+metadata[134,2] <- 5
+metadata[135,2] <- 8.75
+metadata[136,2] <- 3
+metadata$age <- as.numeric(metadata$age)
+
+metadata <- metadata %>% dplyr::select("Run", "age", "sex", "disease", "source_name", "ethnicity", "Instrument") %>% mutate(
+    Age_group = case_when(
+    age >= 60 ~ "Old",
+    age > 30 & age < 60 ~ "Middle-aged",
+    age <= 30 ~ "Young"
+    ))
+
+rownames(metadata) <- metadata$Run
+metadata$Age_group[127:136] <- "HPS"
+
+metadata$Age_group <- factor(metadata$Age_group, levels = c("Young", "Middle-aged", "Old", "HPS"))
+
+```
+
+
+
+Look at boxplots/distribution: 
+
+```{r}
+
+boxplot(data_plain_ratio,ylab="Ratio",xlab="Sample")
+
+```
+
+```{r}
+
+plot(density(data_plain_ratio[,1]), ylim=c(0,0.7), xlim=c(-1,20))
+
+for(i in 2:ncol(data_plain_ratio)){ 
+    lines(density(data_plain_ratio[,i])) 
+
+}
+
+```
+
+```{r}
+
+boxplot(log2(data_plain_TPM),ylab="TPM",xlab="Sample")
+
+```
+
+## Ratio results: 
+
+### Exploratory analysis 
+
+```{r}
+
+pca_res <- prcomp(t(data_plain_ratio), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p1<-ggplot(df_out,aes(x=PC1,y=PC2,color=metadata$Age_group )) +
+  geom_point() + 
+  labs(color="Age Group") +
+  theme_pubclean() 
+
+p1
+
+```
+
+Calculate percentage of variance each PC contributes: 
+
+```{r}
+
+# Manually calculating 
+pca.var <- pca_res$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+
+barplot(pca.var.per[1:20],
+        main="Scree Plot - Top20 PCs",
+        xlab="Principal Components",
+        ylab="Percent Variation",
+        names.arg = pca.var.per[1:20])
+
+```
+
+There is a package that makes exploratory analysis of multivariate data much more rapid: 
+
+https://cran.r-project.org/web/packages/factoextra/readme/README.html
+
+Using factoextra instead:
+
+```{r}
+
+fviz_eig(pca_res)
+
+```
+
+```{r}
+
+fviz_pca_biplot(pca_res, repel = TRUE,
+                col.var = "#2E9FDF", # Variables color
+                col.ind = "#696969", # Individuals color
+                )
+
+```
+
+
+```{r}
+
+# Contributions of variables to PC1
+PC1 <- fviz_contrib(pca_res, choice = "var", axes = 1, top = 30)
+PC1
+
+# Contributions of variables to PC2
+PC2 <- fviz_contrib(pca_res, choice = "var", axes = 2, top = 30)
+PC2
+
+```
+
+Visualise the top genes for PC1... 
+
+First create a dataframe using the output of fviz_contrib. Arrange PC1 in descending order of contribution and extract the top genes. 
+Pull the ratio data for all these genes from 'data_plain_ratio' and then merge together. Join with age data from the processed metadata. Then melt the dataframe with 'age' as one of the ID variables. 
+
+```{r}
+
+gene_list <- PC1[["data"]] %>% arrange(desc(contrib))
+gene_list <- gene_list$name[1:16]
+
+results <- list()
+
+
+for(i in gene_list){
+    print(i)
+
+    results[[i]] <- t(as.data.frame(data_plain_ratio))[1:126, i] #%>% dplyr::select(i)
+}
+
+# Bind together ratios for all samples, remove columns for treatment
+results <- dplyr::bind_cols(results) %>% cbind.data.frame(., metadata$age[1:126])
+results <- melt(results, id.vars = "metadata$age[1:126]")
+
+colnames(results) <- c("Age", "Gene Name", "Ratio short:long isoform")
+
+```
+
+Visualise this data using ggplot2. 
+Specify the formula of the linear model so the equation can be included on the graphs (function from ggpmisc). 
+('stat_cor()' alternative way to do this)
+
+Then use a facet grid to plot each of the top genes by age with a linear model fitted. 
+
+```{r}
+
+# Specify formula of linear model
+my_formula <- y ~ x
+
+# Create graph
+p2 <- ggplot(results, aes(Age, `Ratio short:long isoform`, color = `Gene Name`)) +
+  geom_point() +
+  facet_wrap(~`Gene Name`) + 
+  geom_smooth(method=lm, formula = my_formula) + 
+  stat_poly_eq(formula = my_formula, 
+                aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                parse = TRUE) + 
+  theme_pubclean()
+
+# Remove legend
+p2 <- p2 + theme(legend.position = "none") + theme(plot.margin=grid::unit(c(3,3,3,3), "mm"))
+p2
+
+# Save figure
+ggsave("PC1_ratio.png", width = 9.7, height = 9.7, dpi = 300)
+ggsave("PC1_ratio.pdf", width = 9.5, height = 9.5, dpi = 300)
+
+```
+
+The R^2 value for all the linear models is relatively low (0.2 - 0.3. This is probably due to batch effects as PC2 accounts for a considerable portion of the variance. 
+When PC2 was plotted in the same way the R^2 values were even lower (<0.01) so PC2 is definitely not an age related effect. 
+
+Other genes of interest outside the top 30: GORAB, CISD2, EIF1 STRAP, YAF2 SMAD4, ENAH
+Several are ageing related or ER proteins...
+
+Plot GORAB:
+
+```{r}
+
+GORAB <- cbind.data.frame(t(data_plain_ratio["GORAB",]),
+               metadata$age,
+               metadata$Age_group)
+
+colnames(GORAB) <- c("GORAB short:long isoform ratio", "Age", "Age group")
+
+
+ggplot(GORAB,
+       aes(x=Age, y=`GORAB short:long isoform ratio`, color=`Age group`)) +
+    geom_point() 
+
+```
+
+GORAB is especially interesting because the HPS samples are more similar to the middle-aged/old samples.
+In geroderma osteodysplastica GORAB is mutated and skin becomes loose and wrinkly. Short isoforms of of mRNA generally escape regulation by miRNAs - could it be HPS patients express longer isoforms of GORAB? This might explain some of the similarities in phenotypes.
+
+Additionally, GORAB is a golgi apparatus protein of unknown function - could it be affecting collagen synthesis/regulation? 
+
+Publication: 
+
+http://europepmc.org/article/MED/30631079
+
+Current grant to elucidate function: 
+
+https://gtr.ukri.org/projects?ref=MR%2FN000366%2F1
+
+
+Plot summary results for the ratio data:
+
+```{r}
+ratio_graphs <- ggarrange(p1, p2, 
+          labels = c("A", "B"),
+          ncol = 1, nrow = 2)
+
+ratio_graphs
+
+ggsave("ratio_data.pdf", width = 9.7, height = 15, dpi = 300)
+
+```
+
+
+PVCA estimation of batch effects: 
+
+(Code adapted from Liverpool's CBF's data science course)
+
+```{r}
+
+pheno_formatted <- new("AnnotatedDataFrame", data = metadata[,2:7])
+ratio_data_formatted <- as.matrix(data_plain_ratio)
+colnames(ratio_data_formatted) <- gsub(pattern = "_.*",
+                                       replacement = "",
+                                       x = colnames(ratio_data_formatted))
+
+
+PVCA_data <- ExpressionSet(assayData = ratio_data_formatted, phenoData = pheno_formatted)
+
+
+pvcaObj <- pvcaBatchAssess(abatch = PVCA_data,
+                           batch.factors = colnames(pheno_formatted@data),
+                           threshold = 0.7)
+
+pvca_res <- data.frame(as.data.frame(pvcaObj$label),
+                       t(as.data.frame(pvcaObj$dat)))
+
+colnames(pvca_res) <- c("effect", "variance")
+pvca_res <- pvca_res[-nrow(pvca_res), ]
+
+
+ggplot((pvca_res), aes(x= effect, y = variance)) +
+    geom_bar(stat = 'identity', position = 'dodge', col ='transparent') +
+    scale_fill_discrete(guide = 'none') +
+    theme_bw(base_size = 16) +
+    theme(plot.title = element_text(hjust=0.5),
+          axis.text.x=element_text(angle=45,hjust=1)) +
+    labs(x = 'Effects', y = 'Weighted average \n proportion variance') +
+    ggtitle("PVCA estimation bar chart-non corrected data")
+
+
+```
+
+Two different instruments were used for sequencing and contribute a significant batch effect. Sex and ethnicity also contribute.
+
+
+### Predict age using alternative polyadenylation: 
+
+Train an elastic net to determine age based off alternative polyadenylation of certain genes.
+
+
+First prepare test and training data:
+
+```{r}
+
+set.seed(111)
+
+# Remove the HPS samples as these are progeria samples and will skew results
+labels <- metadata[metadata$Age_group != "HPS",]
+data  <- t(data_plain_ratio[,metadata$Age_group != "HPS"])
+
+# Scale data for model
+data <- scale(data, center = TRUE, scale = TRUE)
+
+# Create indices to divide into test and training data
+indices <- c(sample(1:length(labels$age), length(labels$age)*0.8))
+
+# Test and train split 
+x_train <- data[indices, ]
+y_train <- labels$age[indices]
+x_test <- data[-indices, ]
+y_test <-labels$age[-indices]
+
+```
+
+
+Compare lasso, ridge and elastic net models. Optimise different values of alpha to do so. alpha = 0 is a ridge regression and alpha = 1 is a lasso regression. The values inbetween are elastic net regression models. 
+
+Also optimise different values of lambda using cv.glmnet function. Code adapted from statquest video: 
+https://github.com/StatQuest/ridge_lasso_elastic_net_demo/blob/master/ridge_lass_elastic_net_demo.R
+
+
+```{r}
+
+list_of_fits <- list()
+for (i in 0:10) {
+
+  fit_name <- paste0("alpha", i/10)
+  
+  list_of_fits[[fit_name]] <-
+    cv.glmnet(x_train, y_train, type.measure="mse", alpha=i/10)
+}
+
+
+results <- data.frame()
+for (i in 0:10) {
+  fit_name <- paste0("alpha", i/10)
+  
+  # Use each model to predict 'y' given the Testing dataset
+  predicted <- 
+    predict(list_of_fits[[fit_name]], 
+      s=list_of_fits[[fit_name]]$lambda.1se, newx=x_test)
+  
+  # Calculate the Mean Squared Error...
+  mse <- mean((y_test - predicted)^2)
+  
+  # Store the results
+  temp <- data.frame(alpha=i/10, mse=mse, fit_name=fit_name)
+  results <- rbind(results, temp)
+}
+
+# View the results
+results
+
+
+```
+
+Very low accuracy. Definitely need to remove the batch. So far suggests APA isn't a useful biomarker for age. 
+
+
+## TPM results: 
+
+
+```{r}
+
+pca_res <- prcomp(t(data_plain_TPM), scale. = TRUE)
+
+df_out <- as.data.frame(pca_res$x)
+p3<-ggplot(df_out,aes(x=PC1,y=PC2,color=metadata$Age_group )) +
+  geom_point() + 
+  labs(color="Age Group") +
+  theme_pubclean() 
+
+p3
+
+```
+
+```{r}
+
+fviz_eig(pca_res)
+
+```
+
+```{r}
+
+# Contributions of variables to PC1
+PC1 <- fviz_contrib(pca_res, choice = "var", axes = 1, top = 30)
+PC1
+
+# Contributions of variables to PC2
+PC2 <- fviz_contrib(pca_res, choice = "var", axes = 2, top = 30)
+PC2
+
+# Contributions of variables to PC3
+PC3 <- fviz_contrib(pca_res, choice = "var", axes = 3, top = 30)
+PC3
+
+```
+
+```{r}
+
+gene_list <- PC1[["data"]] %>% arrange(desc(contrib))
+gene_list <- gene_list$name[1:30]
+
+results <- list()
+
+
+for(i in gene_list){
+    print(i)
+
+    results[[i]] <- t(as.data.frame(data_plain_TPM))[1:126, i] #%>% dplyr::select(i)
+}
+
+# Bind together TPMs for all samples, remove columns for treatment
+results <- dplyr::bind_cols(results) %>% cbind.data.frame(., metadata$age[1:126])
+results <- melt(results, id.vars = "metadata$age[1:126]")
+
+colnames(results) <- c("Age", "Gene Name", "TPM")
+
+```
+
+Visualise this data using ggplot2. 
+Specify the formula of the linear model so the equation can be included on the graphs (function from ggpmisc). 
+
+Then use a facet grid to plot each of the top genes by age with a linear model fitted. 
+
+```{r}
+
+# Specify formula of linear model
+my_formula <- y ~ x
+
+# Create graph
+p4 <- ggplot(results, aes(Age, TPM, color = `Gene Name`)) +
+  geom_point() +
+  facet_wrap(~`Gene Name`) + 
+  geom_smooth(method=lm, formula = my_formula) + 
+  stat_poly_eq(formula = my_formula, 
+                aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                parse = TRUE) + 
+  theme_pubclean()
+
+# Remove legend
+p4 <- p4 + theme(legend.position = "none") + theme(plot.margin=grid::unit(c(3,3,3,3), "mm"))
+p4
+
+# Save figure
+#ggsave("PC1_TPM.png", width = 9.7, height = 9.7, dpi = 300)
+#ggsave("PC1_TPM.pdf", width = 9.5, height = 9.5, dpi = 300)
+
+```
+
+To inspect any of the R^2 values: 
+
+```{r}
+
+PDCD4 <- lm(metadata$age ~ as.numeric(data_plain_TPM["PDCD4",]))
+summary(PDCD4)
+
+```
+
+Publications relating to genes of interest: 
+
+https://genomebiology.biomedcentral.com/articles/10.1186/s13059-015-0750-x
+https://www.researchgate.net/publication/306067867_PDCD4_is_a_CSL_associated_protein_with_a_transcription_repressive_function_in_cancer_associated_fibroblast_activation
+
+
+In addition to investigating how the whole transcriptome is affected by ageing wanted to see how type I collagen specifically was affected.
+
+Extract collagen specific data:
+
+```{r}
+
+genes <- cbind.data.frame(t(data_plain_ratio["COL1A2",1:126]),
+               t(data_plain_ratio["COL1A1",1:126]),
+               metadata$age[1:126])
+
+genes <- melt(genes, id.vars = "metadata$age[1:126]")
+
+
+colnames(genes) <- c("Age", "Gene Name", "Ratio short:long isoform")
+
+
+p5 <- ggplot(genes, aes(x=Age, y=`Ratio short:long isoform`, color=`Gene Name`)) + 
+    geom_point() + 
+    geom_smooth(method=lm) +
+    theme_pubclean() + 
+    scale_colour_brewer(palette = "Set1")
+
+p5
+
+```
+
+```{r}
+
+genes <- cbind.data.frame(t(data_plain_TPM["COL1A2",1:126]),
+               t(data_plain_TPM["COL1A1",1:126]),
+               metadata$age[1:126])
+
+genes <- melt(genes, id.vars = "metadata$age[1:126]")
+
+
+colnames(genes) <- c("Age", "Gene Name", "Transcripts per million (TPM)")
+
+
+p6 <- ggplot(genes, aes(x=Age, y=`Transcripts per million (TPM)`, color=`Gene Name`)) + 
+    geom_point() + 
+    geom_smooth(method=lm) +
+    theme_pubclean() + 
+    scale_colour_brewer(palette = "Set1")
+
+p6
+
+```
+
+```{r}
+collagen_graphs <- ggarrange(p5, p6, 
+          labels = c("A", "B"),
+          ncol = 1, nrow = 2)
+
+collagen_graphs
+
+ggsave("collagen_data.pdf", dpi = 300, width = 5, height = 7) 
+
+```
+
+
+```{r}
+
+COL1A1 <- data_plain["COL1A1",-ncol(data_plain)]
+COL1A2 <- data_plain["COL1A2",-ncol(data_plain)]
+
+col_df <- t(rbind(COL1A1, COL1A2))
+
+ratio <- as.data.frame(col_df[grepl("ratio", rownames(col_df)), ])
+TPM <- as.data.frame(col_df[grepl("TPM", rownames(col_df)), ])
+
+rownames(TPM) <-  gsub(pattern = "_.*",
+                                    replacement = "",
+                                    x = rownames(TPM))
+
+rownames(ratio) <- gsub(pattern = "_.*",
+                                    replacement = "",
+                                    x = rownames(ratio))
+
+col_df <- cbind(TPM, ratio)
+colnames(col_df) <- c("COL1A1_TPM", "COL1A2_TPM", "COL1A1_ratio", "COL1A2_ratio")
+
+
+```
+
+
+```{r}
+
+col_df <- col_df %>% mutate(
+    COL1A1_short_form = COL1A1_TPM/(COL1A1_ratio+1)*COL1A1_ratio,
+    COL1A1_long_form = COL1A1_TPM/(COL1A1_ratio+1),
+    COL1A2_short_form = COL1A2_TPM/(COL1A2_ratio+1)*COL1A2_ratio,
+    COL1A2_long_form = COL1A2_TPM/(COL1A2_ratio+1)) %>% add_column(metadata$Age_group, metadata$sex)
+
+# (round(test$COL1A2_long_form) + round(test$COL1A2_short_form)) == round(test$COL1A2_TPM)
+
+```
+
+
+```{r}
+
+write.csv(col_df, "./fleischer_collagen_data.csv")
+
+```
+
+
+
