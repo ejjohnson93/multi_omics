@@ -325,10 +325,10 @@ distance.matrix <- as.dist(1-rfModel$proximity)
 
 mds.stuff <- cmdscale(distance.matrix, eig=TRUE, x.ret=TRUE)
 
-## calculate the percentage of variation that each MDS axis accounts for...
+# calculate the percentage of variation that each MDS axis accounts for...
 mds.var.per <- round(mds.stuff$eig/sum(mds.stuff$eig)*100, 1)
 
-## now make a fancy looking plot that shows the MDS axes and the variation:
+# plot MDS axes and the variation:
 mds.values <- mds.stuff$points
 mds.data <- data.frame(Sample=rownames(mds.values),
   X=mds.values[,1],
