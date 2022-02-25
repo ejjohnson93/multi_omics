@@ -29,7 +29,7 @@ rownames(fold_changes) <- fold_changes$entrez
 fold_changes <- dplyr::select(fold_changes, "logFC")
 
 # Example calcium signalling pathway
-pv.out <- pathview(gene.data = fold_changes, pathway.id = "hsa04020",
+pv_out <- pathview(gene.data = fold_changes, pathway.id = "hsa04020",
                    species = "hsa", out.suffix = "fleischer", kegg.native = T, limit = list(gene = 0.01, cpd = 1))
 
 
@@ -47,13 +47,13 @@ gene_data <- changeDataId(data.input.id = fold_changes,
                           mol.type = "gene",
                           sum.method = "sum")
 
-# Query pathways of interest can be queried using key words
+# Pathways of interest can be queried using key words
 # In this case I just searched the name of the pathway but multiple search terms could be provided
 
 findPathways(c("Crosslinking of collagen fibrils"))
 
 # Create visualisation for collagen cross-linking pathway
-SBGNview.obj <- SBGNview(gene.data = gene_data,
+SBGNview_obj <- SBGNview(gene.data = gene_data,
                          input.sbgn = "R-HSA-2243919",
                          max.gene.value = 0.1,
                          min.gene.value = -0.1,
@@ -61,6 +61,6 @@ SBGNview.obj <- SBGNview(gene.data = gene_data,
                          output.file = "collagen_cross-linking",
                          gene.id.type = "pathwayCommons",
                          output.formats =  c("png", "pdf", "ps"))
-SBGNview.obj
+SBGNview_obj
 
 
